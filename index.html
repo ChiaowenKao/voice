@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>聲音口令開門｜是不是本人的聲音？</title>
+<style>
+  body { font-family: system-ui, "Noto Sans TC", sans-serif; margin: 0; background: #f4f5f7; color: #222; }
+  main { max-width: 480px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 22px; margin: 4px 0 12px; }
+  .card { background: #fff; border-radius: 12px; padding: 14px; margin-bottom: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .card h2 { font-size: 16px; margin: 0 0 8px; }
+  #meterBox { height: 18px; background: #e3e6ea; border-radius: 9px; overflow: hidden; margin: 8px 0; }
+  #meter { height: 100%; width: 0; background: #2da44e; transition: width .05s; }
+  #result { font-size: 24px; font-weight: bold; text-align: center; padding: 14px; border-radius: 12px; margin: 12px 0; background: #ddd; }
+  #result.yes { background: #c8f7c5; color: #11621a; }
+  #result.no  { background: #ffd2d2; color: #8a1111; }
+  #result.rec { background: #fff1c2; color: #7a5a00; }
+  button { font-size: 17px; padding: 12px; border: 0; border-radius: 10px; width: 100%; margin-top: 8px; background: #1f6feb; color: #fff; }
+  button.gray { background: #8b949e; }
+  button.big { font-size: 20px; padding: 18px; background: #cf222e; }
+  button:disabled { opacity: .45; }
+  input[type=text] { font-size: 16px; padding: 10px; width: 100%; box-sizing: border-box; border: 1px solid #ccc; border-radius: 8px; }
+  label { display: block; font-size: 14px; margin: 8px 0 4px; }
+  #status { font-size: 14px; color: #555; min-height: 20px; }
+  .small { font-size: 13px; color: #666; }
+</style>
+</head>
+<body>
+<main>
+  <h1>🎙️ 聲音口令開門</h1>
+  <div id="status">按下按鈕後，手機會詢問是否允許使用麥克風</div>
+  <div id="meterBox"><div id="meter"></div></div>
+  <div id="result">尚未開始</div>
+
+  <div class="card">
+    <h2>① 錄下你的口令（共 3 次）</h2>
+    <label>你的名字</label>
+    <input type="text" id="name" placeholder="例如 Tony">
+    <label>你的口令（自己想一句 3～5 個字的話，例如「芝麻開門」）</label>
+    <input type="text" id="phrase" placeholder="芝麻開門">
+    <button id="btnEnroll">🔴 錄口令（第 1/3 次）</button>
+    <div class="small" id="enrollInfo">尚未錄音</div>
+    <button id="btnClear" class="gray">清除錄音資料</button>
+  </div>
+
+  <div class="card">
+    <h2>② 說口令開門</h2>
+    <button id="btnVerify" class="big" disabled>🎤 按我，說出口令</button>
+    <label>嚴格程度（數字越小越嚴格）：<b id="thVal">—</b></label>
+    <input type="range" id="th" min="0.1" max="3" step="0.05" value="1.4" style="width:100%">
+    <div class="small">錄完 3 次後會自動算出建議值。畫面上的「差異值」小於嚴格程度，就判定是本人。</div>
+  </div>
+
+  <div class="card">
+    <h2>③ 連接 D1 mini（沒接硬體可以跳過）</h2>
+    <label>D1 mini 開門網址</label>
+    <input type="text" id="url" placeholder="https://172.20.10.3/open">
+    <button id="btnTest" class="gray">先開一次這個網址（第一次要按「繼續前往」）</button>
+    <div class="small">通過時，網頁會自動切換到這個網址讓 D1 mini 開門。</div>
+  </div>
+</main>
+
+<script>
+// ================== 設定 ==================
+const REC_SECONDS = 2.5;   // 每次錄音長度（秒）
+const SHOTS = 3;           // 登錄要錄幾次
+const SR = 16000;          // 內部統一的取樣率
+const FRAME = 400, HOP = 160, NFFT = 512, NMEL = 26, NCEP = 13;
+
+const $ = id => document.getElementById(id);
+const statusEl = $('status'), resultEl = $('result'), meterEl = $('meter');
+let enrolled = [];         // 每次錄音的特徵（MFCC 序列）
+let busy = false;
+
+function setStatus(t) { statusEl.textContent = t; }
+function setResult(t, cls) { resultEl.textContent = t; resultEl.className = cls || ''; }
+
+// ================== 讀取／儲存 ==================
+function load() {
+  $('name').value   = localStorage.getItem('vl_name')   || '';
+  $('phrase').value = localStorage.getItem('vl_phrase') || '';
+  $('url').value    = localStorage.getItem('vl_url') || localStorage.getItem('fl_url') || '';
+  try { enrolled = JSON.parse(localStorage.getItem('vl_feats') || '[]'); } catch (e) { enrolled = []; }
+  const th = localStorage.getItem('vl_th'); if (th) $('th').value = th;
+  showEnroll();
+}
+function save() {
+  localStorage.setItem('vl_feats', JSON.stringify(enrolled));
+  localStorage.setItem('vl_th', $('th').value);
+}
+function showEnroll() {
+  const n = enrolled.length;
+  $('enrollInfo').textContent = n ? `已錄 ${n}/${SHOTS} 次（${$('name').value || '未命名'}：「${$('phrase').value || '…'}」）` : '尚未錄音';
+  $('btnEnroll').textContent = n >= SHOTS ? '✅ 已錄好 3 次（要重錄請先清除）' : `🔴 錄口令（第 ${n + 1}/${SHOTS} 次）`;
+  $('btnEnroll').disabled = n >= SHOTS;
+  $('btnVerify').disabled = n < SHOTS;
+  $('thVal').textContent = n >= SHOTS ? $('th').value : '—';
+}
+['name', 'phrase'].forEach(k => $(k).onchange = () => { localStorage.setItem('vl_' + k, $(k).value.trim()); showEnroll(); });
+$('url').onchange = () => localStorage.setItem('vl_url', $('url').value.trim());
+$('th').oninput = () => { $('thVal').textContent = $('th').value; localStorage.setItem('vl_th', $('th').value); };
+
+// ================== 錄音 ==================
+let ctx = null, stream = null;
+async function ensureMic() {
+  if (!window.isSecureContext) throw new Error('需要 https');
+  if (!stream) stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true } });
+  if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+  if (ctx.state === 'suspended') await ctx.resume();
+}
+function record(seconds) {
+  return new Promise(resolve => {
+    const src = ctx.createMediaStreamSource(stream);
+    const proc = ctx.createScriptProcessor(4096, 1, 1);
+    const chunks = []; let got = 0; const need = Math.ceil(seconds * ctx.sampleRate);
+    proc.onaudioprocess = e => {
+      const d = e.inputBuffer.getChannelData(0);
+      chunks.push(new Float32Array(d)); got += d.length;
+      let peak = 0; for (let i = 0; i < d.length; i += 8) peak = Math.max(peak, Math.abs(d[i]));
+      meterEl.style.width = Math.min(100, peak * 160) + '%';
+      if (got >= need) {
+        proc.disconnect(); src.disconnect(); meterEl.style.width = '0%';
+        const all = new Float32Array(got); let o = 0;
+        for (const c of chunks) { all.set(c, o); o += c.length; }
+        resolve(all);
+      }
+    };
+    src.connect(proc); proc.connect(ctx.destination);
+  });
+}
+
+// ================== 聲音特徵（MFCC） ==================
+function resample(x, from) {                 // 降到 16kHz（平均法）
+  const r = from / SR, n = Math.floor(x.length / r), y = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const a = Math.floor(i * r), b = Math.max(a + 1, Math.floor((i + 1) * r));
+    let s = 0; for (let j = a; j < b && j < x.length; j++) s += x[j];
+    y[i] = s / (b - a);
+  }
+  return y;
+}
+function fftMag(re) {                         // 512 點 FFT，回傳功率譜
+  const n = re.length, im = new Float32Array(n);
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1; for (; j & bit; bit >>= 1) j ^= bit; j ^= bit;
+    if (i < j) { [re[i], re[j]] = [re[j], re[i]]; }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = -2 * Math.PI / len, wr = Math.cos(ang), wi = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let cr = 1, ci = 0;
+      for (let k = 0; k < len / 2; k++) {
+        const ar = re[i + k], ai = im[i + k];
+        const br = re[i + k + len / 2] * cr - im[i + k + len / 2] * ci;
+        const bi = re[i + k + len / 2] * ci + im[i + k + len / 2] * cr;
+        re[i + k] = ar + br; im[i + k] = ai + bi;
+        re[i + k + len / 2] = ar - br; im[i + k + len / 2] = ai - bi;
+        const t = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = t;
+      }
+    }
+  }
+  const p = new Float32Array(n / 2 + 1);
+  for (let i = 0; i <= n / 2; i++) p[i] = re[i] * re[i] + im[i] * im[i];
+  return p;
+}
+const melBank = (() => {
+  const mel = f => 2595 * Math.log10(1 + f / 700), inv = m => 700 * (Math.pow(10, m / 2595) - 1);
+  const lo = mel(80), hi = mel(7600), pts = [];
+  for (let i = 0; i < NMEL + 2; i++) pts.push(Math.floor((NFFT + 1) * inv(lo + (hi - lo) * i / (NMEL + 1)) / SR));
+  const bank = [];
+  for (let m = 1; m <= NMEL; m++) {
+    const f = new Float32Array(NFFT / 2 + 1);
+    for (let k = pts[m - 1]; k < pts[m]; k++) f[k] = (k - pts[m - 1]) / Math.max(1, pts[m] - pts[m - 1]);
+    for (let k = pts[m]; k < pts[m + 1]; k++) f[k] = (pts[m + 1] - k) / Math.max(1, pts[m + 1] - pts[m]);
+    bank.push(f);
+  }
+  return bank;
+})();
+function features(raw, rate) {
+  const x = resample(raw, rate);
+  for (let i = x.length - 1; i > 0; i--) x[i] -= 0.97 * x[i - 1];   // 預強調
+  const frames = [], energy = [];
+  for (let s = 0; s + FRAME <= x.length; s += HOP) {
+    const buf = new Float32Array(NFFT); let e = 0;
+    for (let i = 0; i < FRAME; i++) {
+      const v = x[s + i] * (0.54 - 0.46 * Math.cos(2 * Math.PI * i / (FRAME - 1)));
+      buf[i] = v; e += v * v;
+    }
+    const p = fftMag(buf);
+    const logmel = melBank.map(f => { let s2 = 0; for (let k = 0; k < f.length; k++) s2 += f[k] * p[k]; return Math.log(s2 + 1e-10); });
+    const c = [];
+    for (let k = 1; k <= NCEP; k++) {          // DCT，略過第 0 個（音量）
+      let s3 = 0; for (let m = 0; m < NMEL; m++) s3 += logmel[m] * Math.cos(Math.PI * k * (m + 0.5) / NMEL);
+      c.push(s3);
+    }
+    frames.push(c); energy.push(e);
+  }
+  // 只留下「有在說話」的片段
+  const maxE = Math.max(...energy), floor = maxE * 0.02;
+  let a = energy.findIndex(e => e > floor), b = energy.length - 1;
+  while (b > a && energy[b] <= floor) b--;
+  const voiced = frames.slice(Math.max(0, a), b + 1);
+  if (maxE < 1e-3 || voiced.length < 20) return null;   // 太小聲或太短
+  // 平均正規化（讓不同手機、距離的差異變小）
+  const mean = new Array(NCEP).fill(0);
+  voiced.forEach(f => f.forEach((v, i) => mean[i] += v / voiced.length));
+  return voiced.map(f => f.map((v, i) => +(v - mean[i]).toFixed(3)));
+}
+// DTW：比較兩段口令的差異（會自動對齊快慢）
+function dtw(A, B) {
+  const n = A.length, m = B.length, INF = 1e18;
+  let prev = new Float64Array(m + 1).fill(INF), cur = new Float64Array(m + 1);
+  prev[0] = 0;
+  const d = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) { const t = a[i] - b[i]; s += t * t; } return Math.sqrt(s); };
+  for (let i = 1; i <= n; i++) {
+    cur.fill(INF);
+    for (let j = 1; j <= m; j++) cur[j] = d(A[i - 1], B[j - 1]) + Math.min(prev[j], cur[j - 1], prev[j - 1]);
+    [prev, cur] = [cur, prev];
+  }
+  return prev[m] / (n + m) / 10;   // 依長度平均，縮放成容易看的數字
+}
+
+// ================== ① 登錄 ==================
+$('btnEnroll').onclick = async () => {
+  if (busy) return;
+  if (!$('name').value.trim() || !$('phrase').value.trim()) { alert('請先輸入名字和口令'); return; }
+  localStorage.setItem('vl_name', $('name').value.trim());
+  localStorage.setItem('vl_phrase', $('phrase').value.trim());
+  try { await ensureMic(); } catch (e) { setStatus('⚠️ 無法使用麥克風：請允許權限，並用 https 開啟'); return; }
+  busy = true; $('btnEnroll').disabled = true;
+  setResult('3…', 'rec'); await sleep(500); setResult('2…', 'rec'); await sleep(500); setResult('1…', 'rec'); await sleep(500);
+  setResult(`🔴 請說：「${$('phrase').value.trim()}」`, 'rec');
+  const raw = await record(REC_SECONDS);
+  const f = features(raw, ctx.sampleRate);
+  busy = false;
+  if (!f) { setResult('沒聽清楚，請靠近一點、大聲一點再錄一次', 'no'); showEnroll(); return; }
+  enrolled.push(f);
+  if (enrolled.length >= SHOTS) {
+    // 用 3 次錄音彼此的差異，自動算出建議的嚴格程度
+    const ds = [dtw(enrolled[0], enrolled[1]), dtw(enrolled[0], enrolled[2]), dtw(enrolled[1], enrolled[2])];
+    const sug = Math.max(...ds) * 1.25;
+    $('th').value = sug.toFixed(2);
+    setResult(`登錄完成！三次錄音彼此差異 ${ds.map(v => v.toFixed(2)).join('、')}`, 'yes');
+    setStatus(`建議嚴格程度已設為 ${sug.toFixed(2)}，可以開始測試`);
+  } else {
+    setResult(`第 ${enrolled.length} 次完成，請再錄一次`, 'yes');
+  }
+  save(); showEnroll();
+};
+$('btnClear').onclick = () => {
+  enrolled = []; localStorage.removeItem('vl_feats');
+  setResult('已清除錄音資料'); showEnroll();
+};
+
+// ================== ② 驗證 ==================
+$('btnVerify').onclick = async () => {
+  if (busy) return;
+  try { await ensureMic(); } catch (e) { setStatus('⚠️ 無法使用麥克風：請允許權限'); return; }
+  busy = true; $('btnVerify').disabled = true;
+  setResult('🎤 請說出口令…', 'rec');
+  const raw = await record(REC_SECONDS);
+  const f = features(raw, ctx.sampleRate);
+  busy = false; $('btnVerify').disabled = false;
+  if (!f) { setResult('👂 沒聽到聲音，再試一次', 'no'); return; }
+  const dist = Math.min(...enrolled.map(e => dtw(f, e)));
+  const th = parseFloat($('th').value), name = $('name').value || '本人';
+  if (dist < th) {
+    setResult(`✅ 是 ${name}！（差異值 ${dist.toFixed(2)}）`, 'yes');
+    openDoor();
+  } else {
+    setResult(`❌ 不通過（差異值 ${dist.toFixed(2)}，要小於 ${th.toFixed(2)}）`, 'no');
+  }
+};
+
+// ================== ③ 通知 D1 mini ==================
+function openDoor() {
+  const url = $('url').value.trim();
+  if (!url) return;
+  setStatus('🚪 通過！前往 D1 mini 開門…');
+  setTimeout(() => { location.href = url; }, 800);
+}
+$('btnTest').onclick = () => {
+  const url = $('url').value.trim();
+  if (!url) { alert('請先輸入 D1 mini 開門網址'); return; }
+  localStorage.setItem('vl_url', url);
+  window.open(url, '_blank');
+};
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+load();
+if (!window.isSecureContext) setStatus('⚠️ 這個網頁必須用 https:// 開啟，麥克風才能使用');
+setResult(enrolled.length >= SHOTS ? '可以按「說出口令」測試' : '請先錄 3 次口令');
+</script>
+</body>
+</html>
